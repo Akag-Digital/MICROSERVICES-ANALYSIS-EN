@@ -432,7 +432,7 @@ Fase 3 — Backend de mutations
 
 ## 8. Observação Final
 
-O projeto já tem uma estrutura que **antecipa** essa separação. A divisão entre `endpoints/`, `utils/`, `hooks/` e `components/` respeita fronteiras de domínio que mapeiam diretamente para os microserviços. O trabalho é principalmente **mover código que já existe** para processos que podem escalar e falhar independentemente — não reescrever do zero.
+O projeto já tem uma estrutura que **antecipa** essa separação. A divisão entre `endpoints/`, `utils/`, `hooks/` e `components/` respeita fronteiras de domínio que mapeiam diretamente para os microserviços. O trabalho é principalmente **mover código que já existe** para processos que podem escalar e falhar independentemente.
 
 O maior risco de não fazer essa separação não é a lentidão isolada de uma feature: é o **efeito cascata**. Um CSV lento trava o Remix, que atrasa webhooks, que fazem a Shopify retentar, que sobrecarregam mais o banco, que deixa o cron mais lento, que deixa ETAs desatualizados, que causa vendas indevidas de produtos já esgotados.
 
