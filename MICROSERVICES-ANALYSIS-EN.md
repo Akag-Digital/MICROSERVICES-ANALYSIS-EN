@@ -434,7 +434,7 @@ Phase 3 — Mutations backend
 
 ## 8. Final Note
 
-The project already has a structure that **anticipates** this separation. The division between `endpoints/`, `utils/`, `hooks/`, and `components/` respects domain boundaries that map directly to the microservices. The work is primarily about **moving code that already exists** into processes that can scale and fail independently — not rewriting from scratch.
+The project already has a structure that **anticipates** this separation. The division between `endpoints/`, `utils/`, `hooks/`, and `components/` respects domain boundaries that map directly to the microservices. The work is primarily about **moving code that already exists** into processes that can scale and fail independently.
 
 The greatest risk of not making this separation is not the isolated slowness of a single feature: it is the **cascade effect**. A slow CSV import freezes Remix, which delays webhooks, which cause Shopify to retry, which further overloads the database, which slows the cron, which leaves ETAs outdated, which causes overselling of already-exhausted pre-order stock.
 
