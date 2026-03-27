@@ -2,11 +2,11 @@
 
 ## 0. Context: Why the Refactor is Necessary
 
-The system was originally designed to follow the **same container logic as Rove LAB** — a simplified approach, built to operate between **1,000 and at most 5,000 products**. In that context, a Remix monolith was sufficient and appropriate for the existing complexity.
+The system was originally designed to follow the **same container logic as Rove LAB** — a simplified approach, built to operate with **at most 1,000 SKUs**. In that context, a Remix monolith was sufficient and appropriate for the existing complexity.
 
 Over time, new features and business rules were added — especially **parent-child bundle synchronization, ETA validation, bulk import/export, and webhook-based order processing** — without revisiting the base architecture. Each new feature was plugged into the existing structure, which was never designed to support them at scale.
 
-The result is that the **impact of these changes hit the system at its foundation**: synchronization logic, which should be an isolated and asynchronous process, now runs in the same process that serves the UI and responds to webhooks. What was a solid base for 5,000 products becomes a structural bottleneck for 12,000.
+The result is that the **impact of these changes hit the system at its foundation**: synchronization logic, which should be an isolated and asynchronous process, now runs in the same process that serves the UI and responds to webhooks. What was a solid base for 1,000 SKUs becomes a structural bottleneck for 12,000.
 
 This is not a matter of poor implementation — the system served its intended purpose well. It is a matter of **scope evolution**: the new business rules require a different architecture, and this refactor is the natural response to that growth.
 
