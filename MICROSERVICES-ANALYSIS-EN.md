@@ -1,194 +1,194 @@
-# Análise Técnica: Débitos, Gargalos de Escala e Caso para Microserviços
+# Technical Analysis: Technical Debt, Scale Bottlenecks, and the Case for Microservices
 
-## 0. Contexto: Por que o Refactor é Necessário
+## 0. Context: Why the Refactor is Necessary
 
-O sistema foi projetado originalmente para seguir a **mesma lógica de container do Rove LAB** — uma abordagem simplificada, pensada para operar entre **1.000 e no máximo 5.000 produtos**. Nesse contexto, um monolito Remix era suficiente e adequado para a complexidade existente.
+The system was originally designed to follow the **same container logic as Rove LAB** — a simplified approach, built to operate between **1,000 and at most 5,000 products**. In that context, a Remix monolith was sufficient and appropriate for the existing complexity.
 
-Com o tempo, novas funcionalidades e regras de negócio foram adicionadas — especialmente as features de **sincronização de bundles pai-filho, validação de ETA, importação/exportação em massa e processamento de pedidos via webhook** — sem uma revisão da arquitetura base. Cada nova feature foi encaixada na estrutura existente, que não foi concebida para suportá-las em escala.
+Over time, new features and business rules were added — especially **parent-child bundle synchronization, ETA validation, bulk import/export, and webhook-based order processing** — without revisiting the base architecture. Each new feature was plugged into the existing structure, which was never designed to support them at scale.
 
-O resultado é que o **impacto dessas mudanças atingiu o sistema na sua fundação**: a lógica de sincronização, que deveria ser um processo isolado e assíncrono, hoje roda no mesmo processo que serve a UI e responde webhooks. O que era uma base sólida para 5.000 produtos se torna um gargalo estrutural para 12.000.
+The result is that the **impact of these changes hit the system at its foundation**: synchronization logic, which should be an isolated and asynchronous process, now runs in the same process that serves the UI and responds to webhooks. What was a solid base for 5,000 products becomes a structural bottleneck for 12,000.
 
-Não se trata de má implementação — o sistema cumpriu bem o papel para o qual foi desenhado. Trata-se de **evolução de escopo**: as novas regras de negócio exigem uma arquitetura diferente, e esse refactor é a resposta natural a esse crescimento.
+This is not a matter of poor implementation — the system served its intended purpose well. It is a matter of **scope evolution**: the new business rules require a different architecture, and this refactor is the natural response to that growth.
 
-### O Schema Prisma Não Acompanhou a Evolução
+### The Prisma Schema Did Not Keep Up with the Evolution
 
-A estrutura do banco de dados reflete a lógica original simplificada e acumulou limitações que hoje impactam diretamente o fluxo de sincronização e escala:
+The database structure reflects the original simplified logic and has accumulated limitations that now directly impact the synchronization flow and scalability:
 
-**1. `ETA`, `compressionDate` e `completedAt` são `String` no modelo `Container`**
+**1. `ETA`, `compressionDate`, and `completedAt` are `String` in the `Container` model**
 ```prisma
 model Container {
-  ETA             String   // deveria ser DateTime
-  compressionDate String?  // deveria ser DateTime?
-  completedAt     String?  // deveria ser DateTime?
+  ETA             String   // should be DateTime
+  compressionDate String?  // should be DateTime?
+  completedAt     String?  // should be DateTime?
 }
 ```
-Comparações de data acontecem em código de aplicação, não no banco. É impossível fazer `WHERE ETA < NOW()` com índice — o cron de validação de ETA precisa carregar todos os containers para memória e comparar em JS.
+Date comparisons happen in application code, not in the database. It is impossible to run `WHERE ETA < NOW()` with an index — the ETA validation cron must load all containers into memory and compare in JS.
 
-**2. `Variant` e `ProductsWithoutContainers` são modelos paralelos com campos duplicados**
+**2. `Variant` and `ProductsWithoutContainers` are parallel models with duplicated fields**
 ```prisma
-// Variant tem:          preOrderStock, preOrderSales, status, startDate, endDate, templateId, stockManagement...
-// ProductsWithoutContainers tem: preOrderStock, preOrderSales, status, startDate, endDate, templateId, stockManagement...
+// Variant has:                     preOrderStock, preOrderSales, status, startDate, endDate, templateId, stockManagement...
+// ProductsWithoutContainers has:   preOrderStock, preOrderSales, status, startDate, endDate, templateId, stockManagement...
 ```
-São duas tabelas separadas representando conceitos similares, sem base comum. Toda lógica de sincronização precisa ser escrita duas vezes — uma para cada modelo — e qualquer nova feature de pré-venda precisa ser implementada em ambos.
+These are two separate tables representing similar concepts with no shared base. All synchronization logic must be written twice — once per model — and any new pre-order feature must be implemented in both.
 
-**3. `ProductChildren` usa strings Shopify como referência em vez de FK**
+**3. `ProductChildren` uses Shopify strings as references instead of FKs**
 ```prisma
 model ProductChildren {
-  shopifyChildId  String?  // string solta, sem FK para Variant
-  shopifyParentId String?  // string solta, sem FK para ProductsWithoutContainers
-  parentId        Int?     // FK para ProductsWithoutContainers (nullable)
-  childId         Int?     // campo sem FK definida
+  shopifyChildId  String?  // loose string, no FK to Variant
+  shopifyParentId String?  // loose string, no FK to ProductsWithoutContainers
+  parentId        Int?     // FK to ProductsWithoutContainers (nullable)
+  childId         Int?     // field with no FK defined
 }
 ```
-A relação entre um filho e sua `Variant` real é resolvida por matching de string em código, não por integridade referencial. Isso significa que um `shopifyChildId` desatualizado nunca é detectado pelo banco — vira dado silenciosamente inconsistente.
+The relationship between a child and its actual `Variant` record is resolved by string matching in code, not by referential integrity. This means a stale `shopifyChildId` is never detected by the database — it becomes silently inconsistent data.
 
-**4. `Variant.containerId` é obrigatório (non-null)**
+**4. `Variant.containerId` is required (non-null)**
 ```prisma
 model Variant {
-  containerId Int  // obrigatório — toda variante DEVE ter container
+  containerId Int  // required — every variant MUST have a container
 }
 ```
-No fluxo de bundles, filhos de `ProductsWithoutContainers` existem sem container direto. Isso força workarounds no código para criar containers artificiais ou manter dois caminhos de código completamente separados para o mesmo conceito de "variante em pré-venda".
+In the bundle flow, children of `ProductsWithoutContainers` exist without a direct container. This forces workarounds in code to create artificial containers or maintain two completely separate code paths for the same concept of "pre-order variant".
 
-**5. `preOrderStock` e `preOrderSales` como campos diretos na linha**
+**5. `preOrderStock` and `preOrderSales` as direct row fields**
 ```prisma
 preOrderStock Int @default(0)
 preOrderSales Int @default(0)
 ```
-Múltiplos webhooks de pedido processados em paralelo fazem `UPDATE variant SET preOrderSales = preOrderSales + qty` na mesma linha simultaneamente. Sem controle de concorrência explícito, isso é uma race condition em escala — dois webhooks processando ao mesmo tempo podem sobrescrever um ao outro.
+Multiple order webhooks processed in parallel each run `UPDATE variant SET preOrderSales = preOrderSales + qty` on the same row simultaneously. Without explicit concurrency control, this is a race condition at scale — two webhooks processing at the same time can overwrite each other.
 
-**6. Sem campo `shop` em `Variant`, `Container` e `OrderItem`**
+**6. No `shop` field on `Variant`, `Container`, or `OrderItem`**
 ```prisma
-model Variant   { /* sem shop */ }
-model Container { /* sem shop */ }
-model OrderItem { /* sem shop */ }
+model Variant   { /* no shop */ }
+model Container { /* no shop */ }
+model OrderItem { /* no shop */ }
 ```
-Para filtrar dados por loja, é necessário fazer join: `Variant → Product → shop`. Em queries de sincronização com 12k produtos, esse join em cadeia aumenta significativamente o custo das queries e impede índices simples por shop.
+To filter data by shop, a join is required: `Variant → Product → shop`. In synchronization queries with 12k products, this chained join significantly increases query cost and prevents simple shop-based indexes.
 
-**7. `WebhookIdempotency` e `Webhooks` são tabelas separadas com sobreposição**
+**7. `WebhookIdempotency` and `Webhooks` are separate overlapping tables**
 ```prisma
 model Webhooks           { orderId BigInt @unique; data Json? }  // payload
-model WebhookIdempotency { orderId BigInt; webhookType String }  // deduplicação
+model WebhookIdempotency { orderId BigInt; webhookType String }  // deduplication
 ```
-O controle de idempotência cresceu como tabela separada em vez de ser consolidado. Com filas assíncronas (necessárias para 12k produtos), essa lógica precisaria ser repensada de qualquer forma.
+Idempotency control grew as a separate table instead of being consolidated. With async queues (required for 12k products), this logic would need to be rethought anyway.
 
 ---
 
-Esses pontos do schema não bloqueiam o funcionamento atual, mas **multiplicam o custo de cada operação de sincronização** e tornam qualquer extração para microserviços mais complexa do que precisaria ser. O redesign do schema faz parte do refactor arquitetural.
+These schema issues do not break current functionality, but they **multiply the cost of every synchronization operation** and make any extraction into microservices more complex than it needs to be. Schema redesign is part of the architectural refactor.
 
 ---
 
-## 1. Estado Atual: Monolito Remix com Múltiplos Papéis
+## 1. Current State: Remix Monolith Wearing Multiple Hats
 
-O projeto é um **Shopify Admin App** que roda tudo num único processo Node.js/Remix:
-- Serve a UI administrativa (React/Polaris)
-- Processa webhooks em tempo real
-- Executa importações/exportações CSV bloqueantes
-- Faz chamadas síncronas para a Shopify API
-- Roda scripts de cron job externos que usam o mesmo DB
+The project is a **Shopify Admin App** running everything in a single Node.js/Remix process:
+- Serves the admin UI (React/Polaris)
+- Processes webhooks in real time
+- Executes blocking CSV imports/exports
+- Makes synchronous calls to the Shopify API
+- Runs external cron job scripts using the same DB
 
-Isso funciona para dezenas de produtos. Para **12.000 produtos**, cada um desses papéis vai colidir com os outros.
+This works for hundreds of products. For **12,000 products**, each of these roles will collide with the others.
 
 ---
 
-## 2. Débitos Técnicos Identificados
+## 2. Technical Debt Identified
 
-### 2.1 Dead Code e Duplicação Severa
+### 2.1 Dead Code and Severe Duplication
 
-O `refactoring-plan.md` já catalogou ~1.155 linhas eliminíveis, mas o problema vai além da cosmética:
+The `refactoring-plan.md` already catalogued ~1,155 eliminable lines, but the problem goes beyond cosmetics:
 
-| Problema | Arquivo(s) | Impacto |
+| Problem | File(s) | Impact |
 |---|---|---|
-| Dois `orderTagManager` quasi-idênticos | `.js` (~1.389 linhas) + `.server.js` (~1.595 linhas) | Manutenção duplicada, risco de bugs divergentes |
-| 8 hooks de seleção com código idêntico | `useAddProductsSelection`, `useAddProductChildrenSelection`, etc. | Qualquer bug precisa ser corrigido 8 vezes |
-| 4 implementações de `searchProducts` | `products-sku`, `products-by-container`, `products`, `products-parents` | Comportamentos podem divergir silenciosamente |
-| `normalizeToVariantGid()` em 4 lugares diferentes | `orderTagManager`, `separateItemsByContainer`, `syncParentShopifyInventoryNoPreorder`, `csvUpload` | Cada um pode normalizar diferente e causar ID mismatch |
-| `escapeCSV`, `ensureExportsDir`, `streamFinish`, `getUniqueExportFileName` duplicados | `containers/csvExport.js` e `products-parents/csvExport.js` | Qualquer melhoria no CSV precisa ser feita em ambos |
+| Two quasi-identical `orderTagManager` files | `.js` (~1,389 lines) + `.server.js` (~1,595 lines) | Duplicated maintenance, risk of diverging bugs |
+| 8 selection hooks with identical code | `useAddProductsSelection`, `useAddProductChildrenSelection`, etc. | Any bug must be fixed 8 times |
+| 4 implementations of `searchProducts` | `products-sku`, `products-by-container`, `products`, `products-parents` | Behaviors can silently diverge |
+| `normalizeToVariantGid()` in 4 different places | `orderTagManager`, `separateItemsByContainer`, `syncParentShopifyInventoryNoPreorder`, `csvUpload` | Each may normalize differently, causing ID mismatches |
+| `escapeCSV`, `ensureExportsDir`, `streamFinish`, `getUniqueExportFileName` duplicated | `containers/csvExport.js` and `products-parents/csvExport.js` | Any CSV improvement must be made in both places |
 
-### 2.2 Webhooks Registrados Manualmente (Decisão Arquitetural)
+### 2.2 Webhooks Registered Manually (Architectural Decision)
 
-Os webhooks críticos estão **ativos em produção**, registrados **manualmente** via Shopify API — intencionalmente fora do `shopify.app.toml`. Essa é uma decisão arquitetural para ter controle total sobre quando e como os webhooks são registrados, independente do ciclo de deploy do app.
+The critical webhooks are **active in production**, registered **manually** via Shopify API — intentionally outside `shopify.app.toml`. This is an architectural decision to maintain full control over when and how webhooks are registered, independent of the app's deploy cycle.
 
 ```
-orders/create           ← ativo (registro manual)
-orders/updated          ← ativo (registro manual)
-orders/cancelled        ← ativo (registro manual)
-inventory_levels/update ← ativo (registro manual)
-products/update         ← ativo (registro manual)
+orders/create           ← active (manual registration)
+orders/updated          ← active (manual registration)
+orders/cancelled        ← active (manual registration)
+inventory_levels/update ← active (manual registration)
+products/update         ← active (manual registration)
 ```
 
-**Esse padrão deve ser mantido.** O registro manual garante que mudanças no `shopify.app.toml` ou execuções de `npm run deploy` não interfiram nos webhooks em produção.
+**This pattern must be maintained.** Manual registration ensures that changes to `shopify.app.toml` or `npm run deploy` executions do not interfere with production webhooks.
 
-### 2.3 Arquivos Monolíticos sem Separação de Responsabilidade
+### 2.3 Monolithic Files without Separation of Concerns
 
-| Arquivo | Tamanho | Problema |
+| File | Size | Problem |
 |---|---|---|
-| `orderTagManager.server.js` | ~1.595 linhas / 48KB | Geração de tags, processamento de pedidos, lógica de inventário tudo junto |
-| `containerActions.js` | 857 linhas | Criar, atualizar, arquivar e calcular estoque de container num arquivo só |
-| `products-container-id.action.server.js` | 812 linhas | Múltiplos `intent` de formulário numa função gigante |
-| `parentPreOrderAndContainers.js` | 766 linhas | Análise de status + busca de containers + cálculo de inventário |
-| `ContainersTable.jsx` | 833 linhas | Componente UI com lógica de negócio complexa embutida |
+| `orderTagManager.server.js` | ~1,595 lines / 48KB | Tag generation, order processing, and inventory logic all mixed together |
+| `containerActions.js` | 857 lines | Create, update, archive, and calculate container stock in one file |
+| `products-container-id.action.server.js` | 812 lines | Multiple form `intent` handlers in one giant function |
+| `parentPreOrderAndContainers.js` | 766 lines | Status analysis + container fetching + inventory calculation |
+| `ContainersTable.jsx` | 833 lines | UI component with complex business logic embedded |
 
-### 2.4 Exportação CSV para Disco Local
+### 2.4 CSV Export to Local Disk
 
 ```javascript
 // app/utils/containers/csvExport.js
-// Gera arquivo em: public/exports/export_container_data.csv
+// Writes file to: public/exports/export_container_data.csv
 ```
 
-Os arquivos CSV são gravados em `public/exports/` no disco do servidor. Num ambiente com múltiplas réplicas (necessário para 12k produtos), **cada réplica teria seus próprios arquivos**, e a réplica que serviu o download pode não ser a que gerou o CSV.
+CSV files are written to `public/exports/` on the server's local disk. In a multi-replica environment (required for 12k products), **each replica would have its own files**, and the replica that served the download may not be the one that generated the CSV.
 
-### 2.5 Três Padrões de Error Handling Coexistindo
+### 2.5 Three Error Handling Patterns Coexisting
 
 ```javascript
-// Padrão A — correto (com logger)
-} catch (error) { logError("contexto", error); throw error; }
+// Pattern A — correct (with logger)
+} catch (error) { logError("context", error); throw error; }
 
-// Padrão B — silencia o contexto
+// Pattern B — silences context
 } catch (error) { throw error; }
 
-// Padrão C — sem try/catch (erro borbulha não capturado)
-const result = await operacaoArriscada();
+// Pattern C — no try/catch (error bubbles uncaught)
+const result = await riskyOperation();
 ```
 
-Em produção com 12k produtos, um erro não logado num webhook pode fazer o Shopify retentar o mesmo webhook centenas de vezes sem você saber o que aconteceu.
+In production with 12k products, an unlogged error in a webhook can cause Shopify to retry the same webhook hundreds of times without any visibility into what went wrong.
 
 ---
 
-## 3. Por que 12.000 Produtos Vai Travar — Gargalos de Escala Concretos
+## 3. Why 12,000 Products Will Break — Concrete Scale Bottlenecks
 
-### 3.1 Validação de ETA: Loop Serial por Produto
+### 3.1 ETA Validation: Serial Loop per Product
 
 ```javascript
-// app/utils/etaValidationManager.js — linha 30
-for (const parentProduct of parentProducts) {            // loop por TODOS os pais
-  const childVariants = await prisma.variant.findMany({  // 1 query por pai
+// app/utils/etaValidationManager.js — line 30
+for (const parentProduct of parentProducts) {            // loop over ALL parents
+  const childVariants = await prisma.variant.findMany({  // 1 query per parent
     where: { shopifyId: { in: childShopifyIds } }
   });
-  // ... mais queries, mais chamadas Shopify API
+  // ... more queries, more Shopify API calls
 }
 ```
 
-**O problema:** O cron job de validação de ETA faz **pelo menos 1 query de banco por produto pai**. Com 12.000 produtos (hipotético: 3.000 pais × 4 filhos cada), isso são **3.000 queries sequenciais** só para carregar os dados — sem contar as chamadas à Shopify API que vêm depois para atualizar as policies.
+**The problem:** The ETA validation cron makes **at least 1 database query per parent product**. With 12,000 products (hypothetical: 3,000 parents × 4 children each), that is **3,000 sequential queries** just to load the data — not counting the Shopify API calls that follow to update policies.
 
-A execução do cron vai bloquear o banco durante todo esse tempo, deixando a UI lenta para todos os usuários.
+The cron will hold the database the entire time, making the UI slow for all users.
 
-### 3.2 Importação CSV: Query por Linha
+### 3.2 CSV Import: Query per Line
 
 ```javascript
 // app/utils/containers/csvUpload.js
 async function getOrCreateTemplate(templateName, shop) {
-  let template = await prisma.template.findFirst({ ... }); // query por linha CSV
+  let template = await prisma.template.findFirst({ ... }); // query per CSV line
   if (!template) {
-    template = await prisma.template.create({ ... });       // create por linha CSV
+    template = await prisma.template.create({ ... });       // create per CSV line
   }
   return template;
 }
 ```
 
-Um CSV de 12.000 produtos pode ter 12.000+ chamadas `getOrCreateTemplate`, todas síncronas no processo principal do Remix, bloqueando **todas as outras requisições** da UI durante esse tempo.
+A CSV with 12,000 products can trigger 12,000+ `getOrCreateTemplate` calls, all synchronous in the main Remix process, **blocking all other UI requests** during that time.
 
-Além disso, a importação de Products Parents faz chamadas à Shopify GraphQL por bloco de 100 variantes:
+Additionally, the Products Parents import makes Shopify GraphQL calls in chunks of 100 variants:
 
 ```javascript
 // app/utils/products-parents/csvUpload.js
@@ -198,33 +198,33 @@ for (let i = 0; i < unique.length; i += CHUNK) {
 }
 ```
 
-12.000 produtos = 120 chamadas GraphQL sequenciais, cada uma ~300ms = **~36 segundos só de I/O de API**, durante os quais o processo Remix está completamente bloqueado.
+12,000 products = 120 sequential GraphQL calls, during which the Remix process is completely blocked.
 
-### 3.3 Sincronização de Bundle: N+1 Queries
+### 3.3 Bundle Sync: N+1 Queries
 
 ```javascript
 // app/utils/updateChildrenInContainer.js
-for (const item of itemsWithContainers) {     // loop por item do pedido
-  for (const child of item.productChildren) { // loop por filho
+for (const item of itemsWithContainers) {     // loop per order item
+  for (const child of item.productChildren) { // loop per child
     rawOps.push({ childId, containerId, qty });
   }
 }
-// Depois: 1 findMany + N updates (ainda assim, N transações)
+// Then: 1 findMany + N updates (still N transactions)
 ```
 
-Cada pedido com 10 itens × 5 filhos cada = 50 operações de DB dentro do handler de webhook. Quando o webhook de `orders/create` for ativado, **a Shopify espera resposta em 5 segundos** antes de considerar falha e retentar. Se o banco estiver lento (porque o cron está rodando um loop de 12k produtos), o webhook vai falhar e ser retentado, criando duplicações.
+An order with 10 items × 5 children each = 50 DB operations inside the webhook handler. When the `orders/create` webhook is active, **Shopify expects a response within 5 seconds** before considering it a failure and retrying. If the database is slow (because the cron is running a 12k product loop), the webhook will fail and be retried, creating duplicates.
 
-### 3.4 API Pública Sem Cache
+### 3.4 Public API without Cache
 
 ```javascript
-// /api/get-product — chamado pelo JavaScript do tema para CADA pageview
-// Calcula stockCalc = preOrderStock - preOrderSales em tempo real
-// Sem cache, sem Redis, sem CDN
+// /api/get-product — called by theme JavaScript on EVERY pageview
+// Calculates stockCalc = preOrderStock - preOrderSales in real time
+// No cache, no Redis, no CDN
 ```
 
-Uma loja com 12.000 produtos em pré-venda e 1.000 visitantes simultâneos = 1.000 queries simultâneas ao MySQL, todas passando pelo mesmo processo Remix que também está servindo a UI admin e processando webhooks.
+A store with 12,000 pre-order products and 1,000 simultaneous visitors = 1,000 concurrent MySQL queries, all going through the same Remix process that is also serving the admin UI and processing webhooks.
 
-### 3.5 Cron Jobs Externos Compartilham o Mesmo Banco
+### 3.5 External Cron Jobs Share the Same Database
 
 ```bash
 # package.json
@@ -232,15 +232,15 @@ npm run validate-eta:all       # scripts/cronjob-validate-eta.js
 npm run sync:products-parents  # scripts/sync-products-parents.js
 ```
 
-Esses scripts rodam fora do processo Remix mas usam o **mesmo Prisma apontando para o mesmo MySQL**. Quando rodam, disputam conexões com a UI e os webhooks. Com 12k produtos, o cron vai segurar o connection pool por minutos.
+These scripts run outside the Remix process but use the **same Prisma client pointing to the same MySQL**. When running, they compete for connections with the UI and webhooks. With 12k products, the cron will hold the connection pool for an extended time.
 
 ---
 
-## 4. Por que Microserviços São a Solução Correta
+## 4. Why Microservices Are the Right Solution
 
-A questão não é só performance — é **isolamento de falhas** e **escalabilidade independente**. Atualmente, um CSV pesado trava a UI. Um cron lento engole a API pública. Um bug de webhook derruba tudo.
+The issue is not just performance — it is **failure isolation** and **independent scalability**. Currently, a heavy CSV import freezes the UI. A slow cron saturates the public API. A webhook bug can take everything down.
 
-### Arquitetura Proposta
+### Proposed Architecture
 
 ```
                     ┌─────────────────────┐
@@ -249,14 +249,14 @@ A questão não é só performance — é **isolamento de falhas** e **escalabil
                                │ HTTP (5s timeout)
                                ▼
               ┌────────────────────────────────┐
-              │     Webhook Ingestor           │  ← recebe e ACK imediato
-              │   (Node.js leve, sem lógica)   │
+              │     Webhook Ingestor           │  ← receives and ACKs immediately
+              │   (lightweight Node.js)        │
               └──────────────┬─────────────────┘
-                             │ publica em fila
+                             │ publishes to queue
                              ▼
               ┌─────────────────────────────────┐
               │          Message Queue          │
-              │     (BullMQ + Redis  ou  SQS)   │
+              │     (BullMQ + Redis  or  SQS)   │
               └──┬──────────┬──────────┬────────┘
                  │          │          │
      ┌───────────┘   ┌──────┘   ┌─────┘
@@ -264,7 +264,7 @@ A questão não é só performance — é **isolamento de falhas** e **escalabil
 ┌─────────┐  ┌──────────┐  ┌──────────────┐
 │  Order  │  │Inventory │  │   Product    │
 │ Worker  │  │  Worker  │  │   Worker     │
-│(pedidos)│  │(estoque) │  │  (updates)   │
+│(orders) │  │(stock)   │  │  (updates)   │
 └────┬────┘  └────┬─────┘  └──────┬───────┘
      │             │               │
      └──────────┬──┘               │
@@ -274,174 +274,176 @@ A questão não é só performance — é **isolamento de falhas** e **escalabil
      └─────────────────┘   └───────────────────┘
 
 ┌─────────────────────────────────────────────────────┐
-│               Serviços Independentes                │
+│               Independent Services                  │
 ├────────────────┬────────────────┬───────────────────┤
 │  CSV Service   │  Sync Service  │  Storefront API   │
-│ (import/export)│  (cron ETAs,   │  (get-product,    │
-│  assíncrono    │  sync bundles) │  badges — cached) │
-│  com progresso │  agendado      │  Redis/CDN        │
+│ (import/export)│  (ETA crons,   │  (get-product,    │
+│  async with    │  bundle sync)  │  badges — cached) │
+│  progress      │  scheduled     │  Redis/CDN        │
 └────────────────┴────────────────┴───────────────────┘
 
 ┌─────────────────────────────────────────────────────┐
-│              Remix App (atual)                      │
-│  APENAS: UI admin + autenticação Shopify            │
-│  Sem processamento pesado, sem cron, sem CSV sync   │
+│              Remix App (unchanged)                  │
+│  ONLY: admin UI + Shopify authentication            │
+│  No heavy processing, no cron, no CSV sync          │
 └─────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 5. Detalhamento de Cada Microserviço
+## 5. Each Microservice in Detail
 
-### 5.1 Webhook Ingestor — Isolamento Crítico
+### 5.1 Webhook Ingestor — Critical Isolation
 
-**Problema atual:** Webhook handler dentro do Remix faz queries de DB e chamadas Shopify API dentro do timeout de 5s da Shopify. Se falhar, gera retentativas duplicadas que o `WebhookIdempotency` precisa filtrar.
+**Current problem:** The webhook handler inside Remix makes DB queries and Shopify API calls within Shopify's 5s timeout. If it fails, it generates duplicate retries that `WebhookIdempotency` must filter out.
 
-**Solução:** Serviço separado que só faz **duas coisas**: validar HMAC + publicar na fila. Responde 200 em <100ms. O processamento real acontece nos Workers com retry automático, backoff exponencial e dead-letter queue.
+**Solution:** A separate service that only does **two things**: validate HMAC + publish to the queue. Responds 200 in <100ms. The actual processing happens in Workers with automatic retry, exponential backoff, and dead-letter queue.
 
-**Stack sugerida:** Node.js + Fastify (leve e rápido) + BullMQ + Redis
+**Suggested stack:** Node.js + Fastify (lightweight and fast) + BullMQ + Redis
 
-**Por que separado:**
-- Pode ter 0 downtime durante deploys do Remix
-- Pode escalar horizontalmente sem afetar a UI
-- Falhas nos workers não atrasam o ACK para a Shopify
-
----
-
-### 5.2 CSV Service — Sem Bloquear a UI
-
-**Problema atual:** Upload de CSV de 12k linhas bloqueia o processo Remix por 60+ segundos, travando todos os outros usuários. Exportações são salvas em disco local (`public/exports/`), incompatível com múltiplas réplicas.
-
-**Solução:** CSV Service aceita o arquivo, responde imediatamente com um `jobId`, processa em background com BullMQ. A UI faz polling no `jobId` para ver progresso (0%... 45%... 100%). Arquivos exportados vão para **Digital Ocean Spaces** (não disco local), com URL pré-assinada para download direto.
-
-**Stack sugerida:** Node.js Worker + BullMQ + Digital Ocean Spaces + progress events via SSE ou polling
-
-**Por que separado:**
-- Pode processar arquivos grandes sem afetar latência do Remix
-- Pode ter workers dedicados com mais memória (`--max-old-space-size`)
-- Exportações paralelas de múltiplos shops não competem entre si
-- URL do Digital Ocean Spaces funciona em qualquer réplica, sem acoplamento ao disco do servidor
+**Why separate:**
+- Can have zero downtime during Remix deploys
+- Can scale horizontally without affecting the UI
+- Worker failures do not delay the ACK to Shopify
 
 ---
 
-### 5.3 Sync Service — Cron com Controle Real
+### 5.2 CSV Service — Without Blocking the UI
 
-**Problema atual:** `scripts/cronjob-validate-eta.js` roda sequencialmente por todos os shops, segurando conexões do banco por minutos. Não tem fila, não tem retry, não tem observabilidade. Compete com a UI e webhooks pelo mesmo connection pool MySQL.
+**Current problem:** Uploading a 12k-line CSV blocks the Remix process, freezing all other users. Exports are saved to local disk (`public/exports/`), incompatible with multiple replicas.
 
-**Solução:** Sync Service com scheduler (BullMQ Scheduler ou cron Cloud). Valida ETA processando shops em paralelo com concorrência controlada (`concurrency: 5`). Cada shop é um job independente — se um falha, os outros continuam. Usa seu próprio connection pool ao MySQL com menor prioridade.
+**Solution:** CSV Service accepts the file, responds immediately with a `jobId`, processes in background with BullMQ. The UI polls the `jobId` for progress (0%... 45%... 100%). Exported files go to **Digital Ocean Spaces** (not local disk), with a pre-signed URL for direct download.
 
-**Stack sugerida:** BullMQ Scheduler + Redis + pool dedicado Prisma (connection limit separado)
+**Suggested stack:** Node.js Worker + BullMQ + Digital Ocean Spaces + progress events via SSE or polling
 
-**Por que separado:**
-- O cron hoje compete com webhooks e UI pelo mesmo connection pool MySQL
-- Separado, pode ter seu próprio pool com menor prioridade e não impactar a UX
-- Jobs falhos entram em dead-letter queue para reprocessamento manual
-- Observabilidade real: dashboard BullMQ mostra jobs ativos, falhos, tempo médio
+**Why separate:**
+- Can process large files without affecting Remix latency
+- Can have dedicated workers with more memory (`--max-old-space-size`)
+- Parallel exports from multiple shops do not compete with each other
+- Digital Ocean Spaces URL works on any replica, with no disk coupling
 
 ---
 
-### 5.4 Storefront API — Cache na Borda - Analisar a possibilidade de usar um serviço de edge (Cloudflare Workers) para os endpoints públicos chamados pelo tema Shopify, com cache Redis de 60s para aliviar a carga do MySQL. ou outro modelo.
+### 5.3 Sync Service — Cron with Real Control
 
-**Problema atual:** `/api/get-product` é chamado por cada pageview do tema Shopify, sem cache, passando pelo Remix que vai ao MySQL. Com tráfego alto, satura o banco.
+**Current problem:** `scripts/cronjob-validate-eta.js` runs sequentially across all shops, holding database connections for an extended period. No queue, no retry, no observability. Competes with the UI and webhooks for the same MySQL connection pool.
 
-**Contexto importante:** esse endpoint **não é parte do Shopify Admin**. É uma API pública, sem autenticação, chamada pelo JavaScript do tema no browser do cliente final da loja — completamente separada do app Remix embarcado no admin. O app admin (Remix + Polaris) **não muda** e continua embarcado normalmente no Shopify Admin.
+**Solution:** Sync Service with a scheduler (BullMQ Scheduler or Cloud cron). Validates ETA processing shops in parallel with controlled concurrency (`concurrency: 5`). Each shop is an independent job — if one fails, the others continue. Uses its own MySQL connection pool with lower priority.
 
-**Solução:** Extrair apenas os endpoints públicos (`/api/get-product`, `/api/get-checkout-badges`, `/api/validate-eta`) para um serviço de edge com cache Redis de 60s. A query é read-heavy e stateless — candidato perfeito para edge.
+**Suggested stack:** BullMQ Scheduler + Redis + dedicated Prisma pool (separate connection limit)
 
-**Stack sugerida:** Cloudflare Workers + Redis (Upstash) + cache-control headers
+**Why separate:**
+- The cron today competes with webhooks and UI for the same MySQL connection pool
+- Separated, it can have its own lower-priority pool without impacting UX
+- Failed jobs go into a dead-letter queue for manual reprocessing
+- Real observability: BullMQ dashboard shows active, failed, and average job times
 
-**Por que separado:**
-- Latência de ~10ms (edge cache) vs ~200ms (Remix → MySQL)
-- Pode aguentar 100.000 requests/min sem impactar o admin
-- Escala automaticamente no CDN, sem custo de instâncias extras
-- Cache pode ser invalidado seletivamente quando um produto muda (via webhook)
-- A Shopify já usa Cloudflare como CDN — o domínio da loja já passa pela rede deles, o Worker intercepta antes de sair
+---
 
-**Separação clara de responsabilidades:**
+### 5.4 Storefront API — Edge Cache
 
-| | Remix App (não muda) | Storefront API (edge) |
+> Analyze the possibility of using an edge service (Cloudflare Workers) for public endpoints called by the Shopify theme, with a 60s Redis cache to reduce MySQL load — or another model.
+
+**Current problem:** `/api/get-product` is called on every Shopify theme pageview, without cache, going through Remix to MySQL. Under high traffic, it saturates the database.
+
+**Important context:** this endpoint **is not part of the Shopify Admin**. It is a public API, with no authentication, called by theme JavaScript in the end customer's browser — completely separate from the Remix app embedded in the admin. The admin app (Remix + Polaris) **does not change** and continues to be embedded normally in the Shopify Admin.
+
+**Solution:** Extract only the public endpoints (`/api/get-product`, `/api/get-checkout-badges`, `/api/validate-eta`) to an edge service with a 60s Redis cache. The query is read-heavy and stateless — a perfect candidate for edge.
+
+**Suggested stack:** Cloudflare Workers + Redis (Upstash) + cache-control headers
+
+**Why separate:**
+- ~10ms latency (edge cache) vs ~200ms (Remix → MySQL)
+- Can handle 100,000 requests/min without impacting the admin
+- Scales automatically on the CDN, no extra instance cost
+- Cache can be selectively invalidated when a product changes (via webhook)
+- Shopify already uses Cloudflare as CDN — the store domain already passes through their network, the Worker intercepts before leaving it
+
+**Clear separation of responsibilities:**
+
+| | Remix App (unchanged) | Storefront API (edge) |
 |---|---|---|
-| Quem usa | Lojista no Shopify Admin | Cliente final navegando na loja |
-| Autenticação | Shopify OAuth obrigatório | Nenhuma — endpoint público |
-| Frequência | Baixa | Muito alta (cada pageview) |
-| Pode ir para edge? | Não | Sim |
+| Who uses it | Merchant in Shopify Admin | End customer browsing the store |
+| Authentication | Shopify OAuth required | None — public endpoint |
+| Frequency | Low | Very high (every pageview) |
+| Can go to edge? | No | Yes |
 
-**Alternativa mais simples:** se preferir manter tudo na DigitalOcean, um Redis com TTL de 60s na frente do endpoint Remix resolve o problema de carga no MySQL sem nova infraestrutura — não resolve latência geográfica, mas elimina o gargalo principal.
-
----
-
-### 5.5 Backend de Endpoints para Alterações (Mutations API)
-
-**Problema atual:** Mudanças de configuração de produto (ativar pré-venda, mudar template, alterar stock) passam pelo Remix action, que chama a Shopify API de forma **síncrona** enquanto o usuário espera a resposta na tela.
-
-**Solução:** API Service dedicado (Express ou Fastify) que recebe as mutations, aplica no DB, e **enfileira** as atualizações na Shopify API. A UI recebe confirmação imediata; a propagação para a Shopify API acontece em background com rate limiting controlado. O `shopifyAdminRestThrottle.js` — que já existe — é movido para cá.
-
-**Stack sugerida:** Fastify + BullMQ (fila de mutations Shopify) + Redis (rate limit state)
-
-**Por que separado:**
-- Usuário não fica esperando a Shopify API responder (~300ms por chamada)
-- Rate limiting centralizado: múltiplos usuários não ultrapassam o teto da API Shopify
-- Pode retentar mutations falhas sem impactar a UX
-- Remix vira apenas camada de UI/auth, sem lógica de negócio pesada
+**Simpler alternative:** if you prefer to keep everything on DigitalOcean, a Redis with 60s TTL in front of the Remix endpoint resolves the MySQL load problem without new infrastructure — it does not solve geographic latency, but eliminates the main bottleneck.
 
 ---
 
-## 6. Impacto de Cada Gargalo com a Solução
+### 5.5 Mutations API — Backend for Changes
 
-| Cenário | Monolito (12k produtos) | Com Microserviços |
+**Current problem:** Product configuration changes (enabling pre-order, changing templates, updating stock) go through the Remix action, which calls the Shopify API **synchronously** while the user waits on screen.
+
+**Solution:** A dedicated API service (Express or Fastify) that receives mutations, applies them to the DB, and **queues** the Shopify API updates. The UI receives immediate confirmation; propagation to the Shopify API happens in background with controlled rate limiting. The existing `shopifyAdminRestThrottle.js` — which already exists — is moved here.
+
+**Suggested stack:** Fastify + BullMQ (Shopify mutation queue) + Redis (rate limit state)
+
+**Why separate:**
+- User does not wait for the Shopify API to respond
+- Centralized rate limiting: multiple users cannot exceed the Shopify API ceiling
+- Can retry failed mutations without impacting UX
+- Remix becomes only a UI/auth layer, with no heavy business logic
+
+---
+
+## 6. Impact of Each Bottleneck with the Solution
+
+| Scenario | Monolith (12k products) | With Microservices |
 |---|---|---|
-| Cron de ETA rodando | UI trava 5-10 min, webhooks atrasam | Processo isolado, sem impacto na UI |
-| Import CSV de 5k linhas | Todos os usuários sem resposta por ~60s | Job async, UI livre, progresso em tempo real |
-| Pico de 1k pageviews na loja | API pública satura MySQL, admin fica lento | Edge cache absorve, MySQL não vê a carga |
-| Shopify dispara 500 webhooks | Processo Remix pode perder ou duplicar eventos | Fila garante processamento ordenado com retry |
-| Deploy de nova versão | Downtime de ~30s mata webhooks em voo | Ingestor continua up; Workers drenados antes de parar |
-| Bug em CSV import | Derruba o processo principal | Apenas o CSV worker para; UI e webhooks continuam |
-| Shopify API rate limit atingido | Erros 429 chegam na UI para o usuário | Fila segura, retenta com backoff, usuário não vê erro |
+| ETA cron running | UI freezes, webhooks delayed | Isolated process, no UI impact |
+| CSV import of 5k lines | All users unresponsive | Async job, UI stays free, real-time progress |
+| Peak of 1k simultaneous store pageviews | Public API saturates MySQL, admin slows down | Edge cache absorbs, MySQL sees no load |
+| Shopify fires 500 webhooks | Remix process may lose or duplicate events | Queue guarantees ordered processing with retry |
+| New version deploy | In-flight webhooks killed | Ingestor stays up; Workers drained before stopping |
+| Bug in CSV import | Brings down the main process | Only the CSV worker stops; UI and webhooks continue |
+| Shopify API rate limit hit | 429 errors surface to the user | Queue holds, retries with backoff, user sees no error |
 
 ---
 
-## 7. Ordem de Extração Recomendada (Menor Risco → Maior Ganho)
+## 7. Recommended Extraction Order (Lowest Risk → Highest Gain)
 
 ```
-Fase 1 — Sem tocar no core do Remix
+Phase 1 — Without touching the Remix core
   1. Webhook Ingestor + BullMQ/Redis
-     ↳ Extrai os handlers, coloca fila na frente
-     ↳ Remix continua recebendo, mas delega imediatamente
+     ↳ Extract handlers, put queue in front
+     ↳ Remix keeps receiving, but delegates immediately
 
-  2. Storefront API no Edge
+  2. Storefront API on Edge
      ↳ /api/get-product → Cloudflare Worker + Redis cache
-     ↳ Remove carga pesada do MySQL principal
+     ↳ Removes heavy load from main MySQL
 
-Fase 2 — Extrair processamento pesado
-  3. CSV Service assíncrono
-     ↳ Aceita upload, devolve jobId, processa em worker
-     ↳ Digital Ocean Spaces para arquivos exportados
+Phase 2 — Extract heavy processing
+  3. Async CSV Service
+     ↳ Accept upload, return jobId, process in worker
+     ↳ Digital Ocean Spaces for exported files
 
-  4. Sync Service para cron
-     ↳ ETA validation + sync-products-parents como jobs agendados
-     ↳ Pool de conexões separado ao MySQL
+  4. Sync Service for cron
+     ↳ ETA validation + sync-products-parents as scheduled jobs
+     ↳ Separate connection pool to MySQL
 
-Fase 3 — Backend de mutations
+Phase 3 — Mutations backend
   5. Mutations API Service
-     ↳ Operações de escrita com enfileiramento para Shopify API
-     ↳ Remix vira apenas camada de UI/auth
+     ↳ Write operations with queuing for Shopify API
+     ↳ Remix becomes only a UI/auth layer
 
 ```
 
 ---
 
-## 8. Observação Final
+## 8. Final Note
 
-O projeto já tem uma estrutura que **antecipa** essa separação. A divisão entre `endpoints/`, `utils/`, `hooks/` e `components/` respeita fronteiras de domínio que mapeiam diretamente para os microserviços. O trabalho é principalmente **mover código que já existe** para processos que podem escalar e falhar independentemente — não reescrever do zero.
+The project already has a structure that **anticipates** this separation. The division between `endpoints/`, `utils/`, `hooks/`, and `components/` respects domain boundaries that map directly to the microservices. The work is primarily about **moving code that already exists** into processes that can scale and fail independently — not rewriting from scratch.
 
-O maior risco de não fazer essa separação não é a lentidão isolada de uma feature: é o **efeito cascata**. Um CSV lento trava o Remix, que atrasa webhooks, que fazem a Shopify retentar, que sobrecarregam mais o banco, que deixa o cron mais lento, que deixa ETAs desatualizados, que causa vendas indevidas de produtos já esgotados.
+The greatest risk of not making this separation is not the isolated slowness of a single feature: it is the **cascade effect**. A slow CSV import freezes Remix, which delays webhooks, which cause Shopify to retry, which further overloads the database, which slows the cron, which leaves ETAs outdated, which causes overselling of already-exhausted pre-order stock.
 
 ---
 
-## 9. Aviso sobre as Sugestões deste Documento
+## 9. Note on the Suggestions in This Document
 
-As stacks, fases de extração, modelos de cache e decisões arquiteturais descritas aqui são **sugestões iniciais baseadas na análise do estado atual** — não um plano definitivo.
+The stacks, extraction phases, caching models, and architectural decisions described here are **initial suggestions based on the analysis of the current state** — not a definitive plan.
 
-Ainda será feito um **planejamento mais detalhado e direto**, considerando restrições reais de infraestrutura, prioridades de negócio e capacidade de execução. Decisões como escolha de ferramentas (BullMQ vs SQS, Cloudflare vs Redis na DO, redesign do schema vs adaptação incremental) serão revisadas nessa etapa.
+A **more detailed and direct planning session** will still be conducted, considering real infrastructure constraints, business priorities, and execution capacity. Decisions such as tool selection (BullMQ vs SQS, Cloudflare vs Redis on DO, schema redesign vs incremental adaptation) will be revisited at that stage.
 
-Este documento serve como diagnóstico e ponto de partida para essa conversa — não como especificação técnica final.
+This document serves as a diagnosis and starting point for that conversation — not as a final technical specification.
